@@ -6,117 +6,59 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
-	"time"
 
-	"github.com/google/uuid"
+	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2"
-	"oras.land/oras-go/v2/content/file"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"oras.land/oras-go/v2/content/oci"
 )
 
-// TarballNamingStrategy defines how tarball filenames are generated
-type TarballNamingStrategy int
-
-const (
-	IsolatedTempDir TarballNamingStrategy = iota // Default: create isolated temp dir per CR
-	UseCRName                                   // Use CR name to name tarball
-	UseUUID                                     // Use UUID for filename uniqueness
-)
-
-// FetchOCIArtifact pulls the OCI artifact from the registry and saves it locally as a tar.gz
-func FetchOCIArtifact(ctx context.Context, reference string, outputBasePath string, strategy TarballNamingStrategy, crName string) (string, error) {
-	fmt.Println("Fetching OCI artifact:", reference)
-
-	outputPath, tarballName, err := resolveOutputPath(strategy, outputBasePath, crName)
+// FetchOCIArtifact downloads an OCI artifact to a local tarball using the given naming strategy.
+func FetchOCIArtifact(ctx context.Context, ref string, baseOutputPath, crName string, strategy TarballNamingStrategy) (string, error) {
+	outDir, err := ResolveOutputPath(strategy, baseOutputPath, crName, "fetch")
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to resolve output path: %w", err)
 	}
 
-	// Create a local file-based content store
-	tempStore, err := file.New(outputPath)
+	filePath := filepath.Join(outDir, "bundle.tar.gz")
+	fmt.Printf("Fetching OCI artifact %s -> %s\n", ref, filePath)
+
+	target, err := os.Create(filePath)
 	if err != nil {
-		return "", fmt.Errorf("failed to create local store: %w", err)
+		return "", fmt.Errorf("failed to create file: %w", err)
 	}
-	defer tempStore.Close()
+	defer target.Close()
 
-	// Pull artifact from registry
-	desc, err := oras.Copy(ctx, oras.DefaultRegistry, reference, tempStore, "", oras.DefaultCopyOptions)
+	repo, err := remote.NewRepository(ref)
 	if err != nil {
-		return "", fmt.Errorf("failed to pull artifact: %w", err)
+		return "", fmt.Errorf("failed to create remote repository: %w", err)
 	}
 
-	// Create tarball
-	tarballPath := filepath.Join(outputPath, tarballName)
-	f, err := os.Create(tarballPath)
+	tmpDir, err := os.MkdirTemp("", "mfe-oci-pull-*")
 	if err != nil {
-		return "", fmt.Errorf("failed to create tarball: %w", err)
+		return "", fmt.Errorf("failed to create temp dir: %w", err)
 	}
-	defer f.Close()
+	defer os.RemoveAll(tmpDir)
 
-	if err := tempStore.SaveAsTar(ctx, desc, f); err != nil {
-		return "", fmt.Errorf("failed to write tarball: %w", err)
-	}
-
-	fmt.Println("Artifact saved to:", tarballPath)
-	return tarballPath, nil
-}
-
-func resolveOutputPath(strategy TarballNamingStrategy, basePath, crName string) (string, string, error) {
-	var outputPath string
-	var tarballName string
-
-	switch strategy {
-	case IsolatedTempDir:
-		fmt.Println("Using strategy: IsolatedTempDir (create temp directory per CR)")
-		tempDir, err := os.MkdirTemp(basePath, "mfe-*")
-		if err != nil {
-			return "", "", fmt.Errorf("failed to create temp directory: %w", err)
-		}
-		outputPath = tempDir
-		tarballName = "bundle.tar.gz"
-		fmt.Printf("Created temp directory: %s\n", outputPath)
-
-	case UseCRName:
-		fmt.Println("Using strategy: UseCRName (name tarball using CR name)")
-		tarballName = fmt.Sprintf("%s.tar.gz", sanitizeName(crName))
-		if tarballName == ".tar.gz" {
-			fmt.Println("Invalid CR name, falling back to IsolatedTempDir")
-			tempDir, err := os.MkdirTemp(basePath, "mfe-*")
-			if err != nil {
-				return "", "", fmt.Errorf("failed to create temp directory: %w", err)
-			}
-			outputPath = tempDir
-			tarballName = "bundle.tar.gz"
-			fmt.Printf("Created temp directory: %s\n", outputPath)
-		} else {
-			outputPath = basePath
-			fmt.Printf("Output path: %s, Tarball name: %s\n", outputPath, tarballName)
-		}
-
-	case UseUUID:
-		fmt.Println("Using strategy: UseUUID (unique tarball name using UUID)")
-		outputPath = basePath
-		tarballName = fmt.Sprintf("bundle-%s.tar.gz", uuid.NewString())
-		fmt.Printf("Output path: %s, Tarball name: %s\n", outputPath, tarballName)
-
-	default:
-		fmt.Println("Invalid strategy, falling back to IsolatedTempDir")
-		tempDir, err := os.MkdirTemp(basePath, "mfe-*")
-		if err != nil {
-			return "", "", fmt.Errorf("failed to create temp directory: %w", err)
-		}
-		outputPath = tempDir
-		tarballName = "bundle.tar.gz"
-		fmt.Printf("Created temp directory: %s\n", outputPath)
+	store, err := oci.NewWithTemp(tmpDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp store: %w", err)
 	}
 
-	return outputPath, tarballName, nil
-}
+	desc, err := oras.Copy(ctx, repo, "latest", store, "latest", oras.DefaultCopyOptions)
+	if err != nil {
+		return "", fmt.Errorf("failed to pull OCI artifact: %w", err)
+	}
 
-// sanitizeName replaces illegal filename characters
-func sanitizeName(name string) string {
-	re := regexp.MustCompile(`[^a-zA-Z0-9-_]`)
-	return re.ReplaceAllString(strings.ReplaceAll(name, "/", "-"), "_")
+	blobReader, err := store.Fetch(ctx, desc)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch blob: %w", err)
+	}
+	defer blobReader.Close()
+
+	if _, err := io.Copy(target, blobReader); err != nil {
+		return "", fmt.Errorf("failed to write to file: %w", err)
+	}
+
+	fmt.Println("OCI fetch complete.")
+	return filePath, nil
 }
